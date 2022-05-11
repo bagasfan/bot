@@ -1,0 +1,171 @@
+<#
+ .SYNOPSIS
+Auto Generate a RDG file for Azure.
+
+.DESCRIPTION
+Will create a Microsoft Remote Desktop Connection Manager *.RDG file 
+from the Virtual Machines within your Azure Tenant. 
+
+.PARAMETER Path
+Location of the target *.RDG file.
+The default is "My Azure Machines.rdg" placed on the desktop
+
+.PARAMETER Force
+Will create the RDG file *even* if the file already exists (force it).
+
+.PARAMETER Credential
+An array of [PSCredential] objects to be placed in the RDG file.
+
+.PARAMETER AzureCred
+Credentials for logging into Azure
+
+.EXAMPLE
+C:\PS> .\RDGGen.ps1 
+
+Generate the RDG file with no built in credentials.
+
+.EXAMPLE
+C:\PS> $cred = Get-Credential
+C:\PS> .\RDGGen.ps1 -Credential $Cred
+
+Generate an RDG file with credentials from the prompt.
+
+.NOTES
+
+Please be aware that although credentials are stored within the *.RDG file
+"encrypted", any program running within the user's context can extract the
+password as plain text. YMMV.
+
+Copyright Keith Garner, All rights reserved.
+Apache License 
+
+#>
+
+
+[cmdletbinding()]
+param(
+    [pscredential[]] $Credential,
+    [string] $path = ([Environment]::GetFolderPath("Desktop") + "\My Azure Machines.rdg" ),
+    [switch] $force,
+    [pscredential] $AzureCred
+)
+
+#region Support Routines
+
+function Get-CredentialBlob {
+    param( [pscredential[]] $Credential )
+    process {
+        foreach ( $cred in $Credential ) {
+            $PasswordBytes = [System.Text.Encoding]::Unicode.GetBytes($cred.GetNetworkCredential().password)
+            $SecurePassword = [Security.Cryptography.ProtectedData]::Protect($PasswordBytes, $null, [Security.Cryptography.DataProtectionScope]::LocalMachine)
+            $Base64Password = [System.Convert]::ToBase64String($SecurePassword)
+
+@"
+    <credentialsProfiles>
+      <credentialsProfile inherit="None">
+        <profileName scope="Local">$($cred.UserName)</profileName>
+        <userName>$($cred.UserName)</userName>
+        <password>$($Base64Password)</password>
+        <domain>.</domain>
+      </credentialsProfile>
+    </credentialsProfiles>
+
+"@
+        }
+    }
+}
+
+
+function Get-MyAzureServices {
+    param ( $Services )
+
+    foreach ( $Service in $Services ) {
+@"
+  <group>
+       <properties>
+          <expanded>True</expanded>
+          <name>$($Service.label)</name>
+       </properties>
+
+"@
+
+        foreach ( $VM in Get-AzureVM -ServiceName $service.label ) {
+
+            $Port = $VM | Get-AzureEndpoint | ? Name -eq RemoteDesktop | % Port
+@"
+        <server>
+          <properties>
+            <displayName>$($VM.HostName)</displayName>
+            <name>$($VM.ServiceName).cloudapp.net:$Port</name>
+          </properties>
+        </server>
+
+"@ 
+        }
+
+@"
+    </group>
+
+"@        
+    }
+
+}
+
+#endregion
+
+
+# Connect to Azure and get the server list..
+
+Import-module azure -Force -ErrorAction SilentlyContinue
+$Services = get-azureservice -ErrorAction SilentlyContinue
+if ( -not $Services ) {
+    if ( $AzureCred ) {
+        Add-AzureAccount -Credential $AzureCred
+    }
+    else {
+        Add-AzureAccount 
+    }
+    $Services = get-azureservice -ErrorAction SilentlyContinue
+}
+
+
+@"
+<?xml version="1.0" encoding="utf-8"?>
+<RDCMan programVersion="2.7" schemaVersion="3">
+  <file>
+
+$( get-CredentialBlob $Credential )
+$( 
+    if ( $Credential ) {
+@"
+    <logonCredentials inherit="None">
+      <profileName scope="File">$($Credential | Select-object -first 1 | % UserName )</profileName>
+    </logonCredentials>
+"@
+    }
+)
+
+    <remoteDesktop inherit="None">
+      <sameSizeAsClientArea>True</sameSizeAsClientArea>
+      <fullScreen>False</fullScreen>
+      <colorDepth>24</colorDepth>
+    </remoteDesktop>
+
+    <properties>
+      <expanded>True</expanded>
+      <name>Azure</name>
+    </properties>
+
+    $( Get-MyAzureServices $Services )
+
+  </file>
+  <connected />
+  <favorites />
+  <recentlyUsed />
+</RDCMan>
+"@ | out-file -filepath $path -Encoding utf8 -force:$Force
+
+
+if ( test-path $path ) {
+    & 'C:\Program Files (x86)\Microsoft\Remote Desktop Connection Manager\RDCMan.exe' $path
+}
